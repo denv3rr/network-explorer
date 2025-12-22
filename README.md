@@ -191,11 +191,6 @@ Active probing can trigger alerts or violate acceptable use; explicit acknowledg
 - `--outbound-rate <req/sec>`: Rate limit outbound requests (defaults to low-rate safe mode).
 
 ### Deprecated
-- `--outbound-aggressive`: Deprecated alias for `--outbound-active`.
-- `--aggressive-ok`: Deprecated alias for `--active-ok`.
-| Save JSON report | `python run.py --all --json results.json` |
-| Disable colors | `python run.py --all --no-color` |
-| Silent mode | `python run.py --all --silent` |
 
 ---
 
@@ -226,4 +221,5 @@ Active probing can trigger alerts or violate acceptable use; explicit acknowledg
     <img src=https://github.com/denv3rr/denv3rr/blob/main/IMG_4225.gif/>    
   </a>
 </div>
+
 
