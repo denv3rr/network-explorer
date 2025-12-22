@@ -8,6 +8,8 @@ import platform
 import subprocess
 import time
 import re
+import os
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -83,6 +85,12 @@ TOP_TCP_PORTS = [
     9200,9300,9418,11211,15672,27017,27018,27019
 ]
 
+# Ports that are likely to speak HTTP/S for banner probing
+HTTP_PORTS = {
+    80, 81, 88, 443, 444, 591, 593, 8000, 8008, 8080, 8081, 8088, 8443, 8888,
+    9000, 9042, 9080, 9443, 10000, 10443
+}
+
 # Common UDP services that usually respond to packets
 UDP_PAYLOADS = {
     53:  b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x01', # DNS Query A record
@@ -94,7 +102,7 @@ UDP_PAYLOADS = {
 
 # Defaults will be overridden by CLI when --fast is used
 DEFAULT_TIMEOUT = 0.30
-DEFAULT_WORKERS = 256
+DEFAULT_WORKERS = min(128, max(16, (os.cpu_count() or 4) * 4))
 
 # ---------- Helpers ----------
 
@@ -134,18 +142,25 @@ def _progress_bar(done: int, total: int, start_time: float) -> str:
     remaining = (total - done) / rate if rate > 0 else 0
     return f"[{bar}] {pct:6.1%} | {done}/{total} | ETA {remaining:5.1f}s"
 
-def _banner(ip: str, port: int, timeout: float = 0.45) -> str:
+def _banner(ip: str, port: int, timeout: float = 0.45, probe: str = "http") -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect((ip, port))
             try:
-                s.send(b"HEAD / HTTP/1.0\r\n\r\n")
+                if probe == "all":
+                    if port in HTTP_PORTS:
+                        s.send(b"HEAD / HTTP/1.0\r\n\r\n")
+                    else:
+                        s.send(b"\r\n")
+                elif probe == "http" and port in HTTP_PORTS:
+                    s.send(b"HEAD / HTTP/1.0\r\n\r\n")
                 data = s.recv(128)
-                if data: return data.decode(errors="replace").strip().split('\n')[0]
+                if data:
+                    return data.decode(errors="replace").strip().split('\n')[0]
             except: pass
     except: pass
-    return "Unknown"
+    return "Open"
 
 # ---------- Public API ----------
 
@@ -158,6 +173,8 @@ def scan_ports(ip: str,
                 scan_type: str = "top",
                 protocol: str = "tcp",
                 no_banner: bool = True,
+                banner_probe: str = "http",
+                rate_limit: Optional[float] = None,
                 timeout: float = DEFAULT_TIMEOUT,
                 workers: int = DEFAULT_WORKERS):
     """
@@ -179,8 +196,10 @@ def scan_ports(ip: str,
 
     total = len(port_list)
     open_ports = {}
+    no_response_ports = []
     start_time = time.time()
     workers = max(4, workers)
+    track_no_response = protocol == "udp" and total <= 512
 
     # UDP needs slightly longer timeout for round trip
     if protocol == "udp": timeout = max(1.0, timeout * 3)
@@ -198,8 +217,20 @@ def scan_ports(ip: str,
     done = 0
     scan_func = _scan_one_udp if protocol == "udp" else _scan_one_tcp
 
+    interval = 1.0 / float(rate_limit) if rate_limit and rate_limit > 0 else 0.0
+    next_submit = time.time()
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(scan_func, ip, p, timeout): p for p in port_list}
+        futs = {}
+        for p in port_list:
+            if stop_flag and getattr(stop_flag, "is_set", lambda: False)():
+                break
+            if interval:
+                now = time.time()
+                if now < next_submit:
+                    time.sleep(next_submit - now)
+                next_submit += interval
+            futs[ex.submit(scan_func, ip, p, timeout)] = p
         for fut in as_completed(futs):
             if stop_flag and getattr(stop_flag, "is_set", lambda: False)(): break
             port = futs[fut]
@@ -208,16 +239,24 @@ def scan_ports(ip: str,
                 if res:
                     banner_txt = True
                     if not no_banner and protocol == "tcp":
-                        banner_txt = _banner(ip, res, 0.5)
+                        banner_txt = _banner(ip, res, 0.5, probe=banner_probe)
                     open_ports[res] = banner_txt
                     if output_queue: output_queue.put(f"  [OPEN] {ip}:{res}")
+                elif protocol == "udp" and track_no_response:
+                    no_response_ports.append(port)
             except: pass
             done += 1
             _print_progress(done)
 
-    print() 
+    print()
     duration = time.time() - start_time
-    return {"ip": ip, "open_ports": open_ports, "duration": duration}
+    result = {"ip": ip, "open_ports": open_ports, "duration": duration, "protocol": protocol}
+    if protocol == "udp":
+        if track_no_response:
+            result["udp_no_response"] = sorted(no_response_ports)
+        else:
+            result["udp_no_response_count"] = total - len(open_ports)
+    return result
 
 def run_port_scan(start_port: int = 1,
                     end_port: int = 1024,
@@ -226,6 +265,8 @@ def run_port_scan(start_port: int = 1,
                     protocol: str = "tcp",
                     target_hosts=None,
                     no_banner: bool = True,
+                    banner_probe: str = "http",
+                    rate_limit: Optional[float] = None,
                     timeout: float = DEFAULT_TIMEOUT,
                     workers: int = DEFAULT_WORKERS,
                     output_queue=None,
@@ -257,6 +298,8 @@ def run_port_scan(start_port: int = 1,
             scan_type=scan_type,
             protocol=protocol,
             no_banner=no_banner,
+            banner_probe=banner_probe,
+            rate_limit=rate_limit,
             timeout=timeout,
             workers=workers
         )

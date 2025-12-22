@@ -44,8 +44,8 @@ from wifi_scan import scan_wifi
 from bluetooth_scan import scan_bluetooth
 from os_security import check_os_security
 from network_scanner import run_network_metadata_scan, get_quick_identity, lookup_target_ip, get_network_devices
-from port_scanner import run_port_scan 
-from pentest_tools import run_pentest_suite
+from port_scanner import run_port_scan, DEFAULT_WORKERS
+from outbound_testing import run_outbound_suite
 
 try:
     from texttable import Texttable
@@ -255,7 +255,23 @@ def print_summary(results, show_colors: bool) -> None:
                         ports_str = ",".join(map(str, ports_sorted[:15])) + f"... (+{len(ports_sorted)-15})"
                     else:
                         ports_str = ",".join(map(str, ports_sorted))
-                
+
+                if info.get("protocol") == "udp":
+                    no_resp = info.get("udp_no_response")
+                    if no_resp is not None:
+                        if no_resp:
+                            if len(no_resp) > 10:
+                                no_resp_str = ",".join(map(str, no_resp[:10])) + f"... (+{len(no_resp)-10})"
+                            else:
+                                no_resp_str = ",".join(map(str, no_resp))
+                            ports_str = f"open: {ports_str} | noresp: {no_resp_str}"
+                        else:
+                            ports_str = f"open: {ports_str} | noresp: none"
+                    else:
+                        no_resp_count = info.get("udp_no_response_count")
+                        if isinstance(no_resp_count, int):
+                            ports_str = f"open: {ports_str} | noresp: {no_resp_count}"
+
                 rows.append([ip, ports_str, f"{info.get('duration', 0):.1f}s"])
             _table_or_lines(["Host", "Open Ports", "Duration"], rows)
         else:
@@ -299,8 +315,9 @@ def print_summary(results, show_colors: bool) -> None:
 
 # ── Pentest / Inspector ────────────────────────────────────────────────────────
 
-def print_pentest_results(results: dict):
-    print_section("Inspector Results")
+def print_pentest_results(results: dict, show_section: bool = True):
+    if show_section:
+        print_section("Inspector Results")
     
     # Web
     if "web" in results:
@@ -319,6 +336,12 @@ def print_pentest_results(results: dict):
             else:
                 print(f"  {C.OK}Basic security headers present.{C.RESET}")
 
+            cookies = w.get("cookie_issues") or []
+            if cookies:
+                print(f"  {C.WARN}Cookie Issues:{C.RESET}")
+                for c in cookies:
+                    print(f"   - {c}")
+
     # SSL
     if "ssl" in results:
         s = results['ssl']
@@ -329,6 +352,49 @@ def print_pentest_results(results: dict):
              print(f"   Issuer: {s.get('issuer')}")
              print(f"   Expires: {s.get('expiry')}")
              print(f"   Valid: {C.OK}{s.get('valid')}{C.RESET}")
+
+    if results.get("paths"):
+        print(f"\n  {C.HIGHLIGHT}Interesting Paths:{C.RESET}")
+        for p in results["paths"]:
+            print(f"   {p.get('status')}: {p.get('url')}")
+
+    if results.get("admin"):
+        print(f"\n  {C.BAD}Active Probes: Admin Paths (Aggressive){C.RESET}")
+        for p in results["admin"]:
+            print(f"   {p.get('status')}: {p.get('url')}")
+
+    if results.get("methods"):
+        m = results["methods"]
+        if "error" in m:
+            print(f"\n  {C.BAD}Active Probes: HTTP Methods{C.RESET} {m['error']}")
+        else:
+            allow = m.get("allow") or "Unknown"
+            print(f"\n  {C.BAD}Active Probes: HTTP Methods{C.RESET} {allow}")
+
+    if results.get("active_paths"):
+        print(f"\n  {C.BAD}Active Probes: Active Paths{C.RESET}")
+        for p in results["active_paths"]:
+            print(f"   {p.get('status')}: {p.get('url')}")
+
+    if results.get("osint"):
+        print(f"\n  {C.HIGHLIGHT}External OSINT:{C.RESET}")
+        osint = results["osint"]
+        if osint.get("rdap_domain"):
+            name = osint["rdap_domain"].get("ldhName") or osint["rdap_domain"].get("handle")
+            if name:
+                print(f"   RDAP Domain: {name}")
+        if osint.get("rdap_ip"):
+            handle = osint["rdap_ip"].get("handle")
+            if handle:
+                print(f"   RDAP IP: {handle}")
+        if osint.get("ip_geo"):
+            geo = osint["ip_geo"]
+            parts = [geo.get("city"), geo.get("region"), geo.get("country_name")]
+            loc = ", ".join([p for p in parts if p])
+            if loc:
+                print(f"   Geo: {loc}")
+            if geo.get("org"):
+                print(f"   Org: {geo.get('org')}")
 
     # DNS
     if "dns" in results:
@@ -354,6 +420,18 @@ def print_lookup_results(data: dict):
     print(f"  {C.HIGHLIGHT}Timezone:{C.RESET} {data.get('timezone')}")
     print(f"  {C.HIGHLIGHT}AS Number:{C.RESET} {data.get('as')}")
     print("  ==========================================================\n")
+
+def print_outbound_results(results: dict):
+    print_section("Outbound Testing Results")
+    meta = results.get("_meta") or {}
+    if meta:
+        mode = "ACTIVE" if meta.get("active") else "SAFE"
+        ext = "EXTERNAL OSINT ENABLED" if meta.get("external") else "NO EXTERNAL OSINT"
+        rate = meta.get("rate_limit")
+        rate_str = f"{rate}/s" if rate else "unlimited"
+        print(f"  {C.WARN}Mode:{C.RESET} {mode} | {ext} | rate={rate_str}")
+    webdns = results.get("webdns") or {}
+    print_pentest_results(webdns, show_section=False)
 
 
 # ── Orchestrator ───────────────────────────────────────────────────────────────
@@ -386,8 +464,10 @@ class Scanner:
             protocol=kwargs.get("protocol", "tcp"),
             target_hosts=kwargs.get("hosts"),
             no_banner=kwargs.get("no_banner", True),
+            banner_probe=kwargs.get("banner_probe", "http"),
+            rate_limit=kwargs.get("rate_limit"),
             timeout=kwargs.get("timeout", 0.30),
-            workers=kwargs.get("workers", 256),
+            workers=kwargs.get("workers", DEFAULT_WORKERS),
             stop_flag=self.stop_flag,
             output_queue=self.output_queue,
         )
@@ -398,6 +478,7 @@ class Scanner:
 
         common = {"stop_flag": self.stop_flag, "output_queue": self.output_queue}
         total = len(selected_modules)
+        allow_external = bool(scan_options.get("allow_external", False))
 
         for i, module in enumerate(selected_modules, 1):
             if not scan_options.get("silent"):
@@ -408,11 +489,14 @@ class Scanner:
                 try:
                     # Explicit mapping for modules that need specific args
                     if module == "wifi":
-                        res = func(wifi_interface=scan_options.get("wifi_interface"), 
-                                    do_geolocation=scan_options.get("geo"), 
+                        res = func(wifi_interface=scan_options.get("wifi_interface"),
+                                    do_geolocation=scan_options.get("geo"),
+                                    allow_external=allow_external,
                                     diag=scan_options.get("diag"), **common)
                     elif module == "ports":
-                        res = self._run_port_scan(**scan_options) 
+                        res = self._run_port_scan(**scan_options)
+                    elif module == "network":
+                        res = func(allow_external=allow_external, **common)
                     else:
                         res = func(**common)
                     
@@ -449,7 +533,7 @@ def main_menu() -> tuple[list[str], bool, str]:
     print(f"  {C.HIGHLIGHT}2.{C.RESET} Wi-Fi Scan")
     print(f"  {C.HIGHLIGHT}3.{C.RESET} Port Scan")
     print(f"  {C.HIGHLIGHT}4.{C.RESET} LAN Device Discovery (ARP + Vendor)")
-    print(f"  {C.HIGHLIGHT}5.{C.RESET} Web & DNS Inspector")
+    print(f"  {C.HIGHLIGHT}5.{C.RESET} Outbound Testing (Web/DNS)")
     print(f"  {C.HIGHLIGHT}6.{C.RESET} IP/Domain Lookup")
     print(f"  {C.HIGHLIGHT}7.{C.RESET} Network Metadata")
     print(f"  {C.HIGHLIGHT}8.{C.RESET} OS Security Check")
@@ -463,7 +547,7 @@ def main_menu() -> tuple[list[str], bool, str]:
     if choice == "2": return (["wifi"], True, None)
     if choice == "3": return (["ports"], False, None)
     if choice == "4": return ([], True, "lan_discovery")
-    if choice == "5": return ([], True, "pentest")
+    if choice == "5": return ([], True, "outbound")
     if choice == "6": return ([], True, "lookup")
     if choice == "7": return (["network"], True, None)
     if choice == "8": return (["os"], True, None)
@@ -490,6 +574,8 @@ def main():
     parser.add_argument("--no-banner", action="store_true", help="Skip banner grabbing")
     parser.add_argument("--timeout", type=float, default=None)
     parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--rate", type=float, default=None, help="Rate limit ports/sec per host")
+    parser.add_argument("--profile", choices=["safe", "normal", "aggressive"], default="aggressive", help="Scan profile")
     # Wi-Fi
     parser.add_argument("--geo", action="store_true", help="Wi-Fi geolocation")
     parser.add_argument("--wifi_interface", help="Specify Wi-Fi interface")
@@ -499,6 +585,15 @@ def main():
     parser.add_argument("--all", action="store_true", help="Run all modules")
     parser.add_argument("--silent", action="store_true", help="Reduce console chatter")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument("--external", action="store_true", help="Allow external lookups (public IP, MAC vendor, geo)")
+    parser.add_argument("--yes", action="store_true", help="Skip confirmation prompts")
+    # Outbound testing
+    parser.add_argument("--outbound", nargs="?", const="__PROMPT__", help="Run outbound testing against a target")
+    parser.add_argument("--outbound-active", action="store_true", help="Enable active outbound probing")
+    parser.add_argument("--outbound-aggressive", action="store_true", help="Deprecated (use --outbound-active)")
+    parser.add_argument("--outbound-rate", type=float, default=None, help="Rate limit requests/sec for outbound testing")
+    parser.add_argument("--active-ok", action="store_true", help="Acknowledge active probing risk")
+    parser.add_argument("--aggressive-ok", action="store_true", help="Deprecated (use --active-ok)")
 
     args = parser.parse_args()
 
@@ -525,7 +620,7 @@ def main():
     print("")
 
     # 5. One-Shot CLI Check
-    any_flag = any([args.wifi, args.bluetooth, args.os, args.network, args.ports, args.all])
+    any_flag = any([args.wifi, args.bluetooth, args.os, args.network, args.ports, args.all, args.outbound])
     
     if any_flag:
         # Non-Interactive Mode
@@ -542,12 +637,41 @@ def main():
             auto_mode = False 
 
         # Execute Scan
+        if args.outbound:
+            target = None
+            if args.outbound == "__PROMPT__":
+                target = input(f"  {C.OK}Enter Target IP/Domain:{C.RESET} ").strip()
+            else:
+                target = args.outbound
+            if not target:
+                print(f"  {C.WARN}No outbound target provided.{C.RESET}")
+                return
+            want_active = bool(args.outbound_active or args.outbound_aggressive)
+            if want_active and not (args.active_ok or args.aggressive_ok):
+                print(f"\n  {C.BAD}Active outbound probing requested.{C.RESET}")
+                print(f"  {C.BAD}This can violate acceptable use or trigger alerts. Use only with explicit permission.{C.RESET}")
+                print(f"  {C.BAD}Re-run with --active-ok to proceed.{C.RESET}")
+                return
+            if not _confirm_action("outbound testing", allow_external=True, assume_yes=args.yes, silent=args.silent):
+                return
+            aggressive = want_active
+            res = run_outbound_suite(
+                target,
+                aggressive=aggressive,
+                rate_limit=args.outbound_rate,
+                allow_external=args.external,
+            )
+            print_outbound_results(res)
+            return
+
+        if not _confirm_action("scan", allow_external=args.external, assume_yes=args.yes, silent=args.silent):
+            return
         _run_scan_logic(selected, auto_mode, args)
         return # Exit after CLI scan
 
     # 6. Interactive Loop
     if not args.silent:
-        _print_identity()
+        _print_identity(allow_external=args.external)
 
     while True:
         selected, auto_mode, special_action = main_menu()
@@ -555,6 +679,8 @@ def main():
         
         # Handle Lookup Tool
         if special_action == "lookup":
+            if not _confirm_action("IP/domain lookup", allow_external=True, assume_yes=args.yes, silent=args.silent):
+                continue
             while True:
                 print(f"\n  {C.HEADER}:: IP/Domain Lookup ::{C.RESET}")
                 target = input(f"  {C.OK}Enter IP/Domain (or '1' for Menu, '0' for Exit):{C.RESET} ").strip()
@@ -563,30 +689,44 @@ def main():
                 if target == '0': sys.exit(0)
                 if not target: continue
 
-                res = lookup_target_ip(target)
+                res = lookup_target_ip(target, allow_external=True)
                 print_lookup_results(res)
             continue
 
-        # Handle Pentest Tool
-        if special_action == "pentest":
+        # Handle Outbound Testing
+        if special_action == "outbound":
+            if not _confirm_action("outbound testing", allow_external=True, assume_yes=args.yes, silent=args.silent):
+                continue
+            aggressive = False
+            if not args.silent:
+                resp = input(f"  {C.WARN}Enable active probing? (y/N):{C.RESET} ").strip().lower()
+                if resp in ("y", "yes"):
+                    aggressive = _confirm_active("Outbound Testing")
             while True:
-                print(f"\n  {C.HEADER}:: Web & DNS Inspector ::{C.RESET}")
+                print(f"\n  {C.HEADER}:: Outbound Testing ::{C.RESET}")
                 target = input(f"  {C.OK}Enter Target IP/Domain (or '1' for Menu, '0' for Exit):{C.RESET} ").strip()
-                
+
                 if target == '1': break
                 if target == '0': sys.exit(0)
                 if not target: continue
 
                 print(f"\n  {C.MUTED}Running checks...{C.RESET}")
-                res = run_pentest_suite(target)
-                print_pentest_results(res)
+                res = run_outbound_suite(
+                    target,
+                    aggressive=aggressive,
+                    rate_limit=None,
+                    allow_external=args.external,
+                )
+                print_outbound_results(res)
             continue
 
         # Handle LAN Discovery
         if special_action == "lan_discovery":
+            if not _confirm_action("LAN discovery", allow_external=args.external, assume_yes=args.yes, silent=args.silent):
+                continue
             while True:
                 print(f"  {C.MUTED}Scanning local ARP table / Neighbors...{C.RESET}")
-                devs = get_network_devices()
+                devs = get_network_devices(allow_external=args.external)
                 print_section("LAN Discovery (ARP/Neighbor)")
                 
                 if devs["IPv4"]:
@@ -603,6 +743,8 @@ def main():
             continue
 
         # Handle Standard Scans
+        if not _confirm_action("scan", allow_external=args.external, assume_yes=args.yes, silent=args.silent):
+            continue
         logging.info(f"{C.OK}Scan started.{C.RESET}\n")
         _run_scan_logic(selected, auto_mode, args)
         
@@ -613,9 +755,9 @@ def main():
         
         # Loop restarts here automatically
 
-def _print_identity():
+def _print_identity(allow_external: bool):
     try:
-        ident = get_quick_identity()
+        ident = get_quick_identity(allow_external=allow_external)
         ip = ident.get("local_ip") or "?"
         host = ident.get("hostname") or "?"
         conn = ident.get("connection_type") or "Unknown"
@@ -634,22 +776,75 @@ def _print_identity():
         print(f"  {C.HEADER}====================================={C.RESET}\n\n\n") 
     except: pass
 
+def _confirm_action(action_label: str, *, allow_external: bool, assume_yes: bool, silent: bool) -> bool:
+    if assume_yes or silent:
+        return True
+    warn = f"This will actively run a {action_label}."
+    if allow_external:
+        warn += " It may send data to third-party services."
+    print(f"\n  {C.WARN}{warn}{C.RESET}")
+    resp = input(f"  {C.OK}Proceed? (y/N):{C.RESET} ").strip().lower()
+    return resp in ("y", "yes")
+
+def _confirm_active(action_label: str) -> bool:
+    print(f"\n  {C.BAD}Active probing enabled for {action_label}.{C.RESET}")
+    print(f"  {C.BAD}This can trigger IDS/IPS alerts, violate acceptable use, or degrade targets.{C.RESET}")
+    print(f"  {C.BAD}Only proceed if you have explicit permission.{C.RESET}")
+    resp = input(f"  {C.OK}Type AGREE to continue:{C.RESET} ").strip()
+    return resp == "AGREE"
+
+def _apply_port_profile(scan_options, args):
+    profile = args.profile
+
+    if profile == "safe":
+        scan_options.setdefault("scan_type", "top")
+        scan_options.setdefault("protocol", "tcp")
+        scan_options.setdefault("no_banner", True)
+        scan_options.setdefault("timeout", 0.25 if args.timeout is None else args.timeout)
+        scan_options.setdefault("workers", min(DEFAULT_WORKERS, 64) if args.workers is None else args.workers)
+        scan_options.setdefault("rate_limit", 200.0 if args.rate is None else args.rate)
+        scan_options.setdefault("banner_probe", "http")
+        return
+
+    if profile == "aggressive":
+        scan_options.setdefault("scan_type", "connect")
+        scan_options.setdefault("protocol", "tcp")
+        scan_options.setdefault("timeout", 0.5 if args.timeout is None else args.timeout)
+        scan_options.setdefault("workers", min(DEFAULT_WORKERS * 2, 256) if args.workers is None else args.workers)
+        if args.no_banner:
+            scan_options.setdefault("no_banner", True)
+        else:
+            scan_options.setdefault("no_banner", False)
+        scan_options.setdefault("banner_probe", "all")
+        return
+
+    # normal
+    scan_options.setdefault("banner_probe", "http")
+
 def _run_scan_logic(selected, auto_mode, args):
     """Helper to run the actual Scanner orchestrator to avoid code duplication."""
     scan_options = {}
     if args.wifi_interface: scan_options["wifi_interface"] = args.wifi_interface
-    if args.geo: scan_options["geo"] = True
+    if args.geo:
+        if args.external:
+            scan_options["geo"] = True
+        else:
+            msg = "Wi-Fi geolocation requested but external lookups are disabled."
+            logging.warning(msg)
+            if not args.silent:
+                print(f"  {C.WARN}{msg} Use --external to enable.{C.RESET}")
     if args.wifi_diag: scan_options["diag"] = True
     if args.hosts: scan_options["hosts"] = [h.strip() for h in args.hosts.split(",") if h.strip()]
     if args.silent: scan_options["silent"] = True
+    scan_options["allow_external"] = bool(args.external)
 
     if "ports" in selected:
-        if args.fast or args.silent or auto_mode:
+        if (args.fast or args.silent or auto_mode) and args.profile != "aggressive":
             scan_options["scan_type"] = "top"
             scan_options["protocol"] = "tcp"
             scan_options["no_banner"] = True
             scan_options["timeout"] = 0.15 if args.timeout is None else args.timeout
-            scan_options["workers"] = 300 if args.workers is None else args.workers
+            scan_options["workers"] = DEFAULT_WORKERS if args.workers is None else args.workers
             if not args.silent:
                 print(f"  {C.OK}[AUTO]{C.RESET} Running Fast Port Scan (Top TCP)...")
         else:
@@ -657,8 +852,11 @@ def _run_scan_logic(selected, auto_mode, args):
             scan_options["scan_type"] = stype
             scan_options["protocol"] = proto
             scan_options["no_banner"] = bool(args.no_banner)
-            
+
         if args.ports: scan_options["port_range"] = args.ports
+        if args.rate is not None: scan_options["rate_limit"] = args.rate
+
+        _apply_port_profile(scan_options, args)
 
     scanner = Scanner(port_range=args.ports if args.ports else "1-1024")
     scanner.run_scan(selected, **scan_options)

@@ -6,13 +6,14 @@ setup(
     description="Network security and metadata explorer",
     packages=find_packages(),
     py_modules=[
-        "network_explorer", 
-        "wifi_scan", 
-        "port_scanner", 
-        "bluetooth_scan", 
-        "os_security", 
+        "network_explorer",
+        "wifi_scan",
+        "port_scanner",
+        "bluetooth_scan",
+        "os_security",
         "network_scanner",
-        "pentest_tools"
+        "pentest_tools",
+        "outbound_testing"
     ],
     install_requires=[
         "requests",

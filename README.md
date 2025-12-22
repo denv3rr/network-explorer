@@ -63,6 +63,9 @@ A Python tool for quick **network and host security assessment**.
   - Detects Firewall status and Antivirus presence on Windows, Linux, and macOS.
 - **Network metadata scanning**
   - Identifies connection type (Wired/Wi-Fi), local identity, public IP, ISP, ASN, and geographic info.
+- **Outbound testing (Web/DNS)**
+  - Safe by default with very low request rate; optional active probing with explicit warning/acknowledgement.
+  - External OSINT (RDAP, DNS-over-HTTPS, GeoIP) only when `--external` is enabled.
 - **Full Scan mode**
   - One-click execution of all modules with intelligent defaults.
 
@@ -85,7 +88,8 @@ python run.py
 ### **1. Check Requirements**
 
 - **Python 3.9+**
-- Modules auto-installed at runtime via `requirements.txt`. See <a href="#quick-start">Quick Start</a> above.
+- Modules auto-installed at runtime via `requirements.txt` (you may be prompted). See <a href="#quick-start">Quick Start</a> above.
+  - Set `NEX_AUTO_INSTALL=1` to allow auto-install without prompts.
   - `requests`
   - `ifaddr`
   - `texttable`
@@ -129,9 +133,66 @@ python run.py
 | Wi-Fi scan only | `python run.py --wifi` |
 | Port scan (top) | `python run.py --ports` |
 | Port scan (custom range) | `python run.py --ports 1-2000` |
+| Port scan profile | `python run.py --ports --profile aggressive` |
+| Port scan rate limit | `python run.py --ports --rate 200` |
 | Network metadata (wired support) | `python run.py --network` |
 | OS security check | `python run.py --os` |
 | Bluetooth scan | `python run.py --bluetooth` |
+| Outbound testing (safe, low-rate) | `python run.py --outbound example.com` |
+| Outbound testing with OSINT | `python run.py --outbound example.com --external` |
+| Outbound testing (active) | `python run.py --outbound example.com --outbound-active --active-ok` |
+| Outbound testing with rate limit | `python run.py --outbound example.com --outbound-rate 5` |
+| Outbound active requires ack | `--active-ok` must be supplied to proceed |
+| Allow external lookups | `python run.py --network --external` |
+| Skip confirmation prompts | `python run.py --all --yes` |
+| Wi-Fi diagnostic dump | `python run.py --wifi --wifi-diag` |
+| Specify Wi-Fi interface | `python run.py --wifi --wifi_interface "Wi-Fi"` |
+
+## Flags
+
+### Safe vs Active
+- **Safe mode**: Minimal, low-rate requests and passive checks only.
+- **Active mode**: Sends additional probes (paths/methods); requires `--outbound-active` and `--active-ok`.
+
+### FAQ
+
+**Does safe mode avoid touching the target?**  
+Safe mode still makes low-rate HTTP/DNS requests to the target; it is designed to be low-impact, not invisible.
+
+**How do I enable external OSINT?**  
+Use `--external` to allow RDAP, DNS-over-HTTPS, and GeoIP lookups.
+
+**Why do I need `--active-ok`?**  
+Active probing can trigger alerts or violate acceptable use; explicit acknowledgement is required.
+
+### General
+- `--external`: Allow external lookups (public IP, MAC vendor, OSINT).
+- `--yes`: Skip confirmation prompts.
+- `--json <file>`: Write full results to a JSON file.
+
+### Port Scanning
+- `--ports [start-end]`: Run port scan (default `1-1024` when provided).
+- `--profile safe|normal|aggressive`: Port scan profile.
+- `--rate <ports/sec>`: Rate limit ports/sec per host.
+- `--timeout <seconds>`: Socket timeout.
+- `--workers <count>`: Worker threads.
+- `--no-banner`: Skip banner grabbing.
+
+### Wi-Fi
+- `--wifi`: Run Wi-Fi scan.
+- `--wifi_interface "<name>"`: Specify Wi-Fi interface.
+- `--wifi-diag`: Print diagnostic netsh output.
+- `--geo`: Enable Wi-Fi geolocation (requires `--external`).
+
+### Outbound Testing
+- `--outbound [target]`: Run outbound testing (safe by default).
+- `--outbound-active`: Enable active outbound probing (requires acknowledgement).
+- `--active-ok`: Acknowledge active probing risk to proceed.
+- `--outbound-rate <req/sec>`: Rate limit outbound requests (defaults to low-rate safe mode).
+
+### Deprecated
+- `--outbound-aggressive`: Deprecated alias for `--outbound-active`.
+- `--aggressive-ok`: Deprecated alias for `--active-ok`.
 | Save JSON report | `python run.py --all --json results.json` |
 | Disable colors | `python run.py --all --no-color` |
 | Silent mode | `python run.py --all --silent` |
@@ -155,7 +216,6 @@ python run.py
 |-------|-----|
 | **Wi-Fi scan shows “No Wi-Fi data.”** | Ensure Wi-Fi adapter is enabled and, on Windows, run as **Administrator** with **Location Services ON**. |
 | **No results on wired connection** | Use `--network` to retrieve public IP and geolocation via IP-based lookup. |
-| **Bluetooth not implemented** | Placeholder module |
 | **Permission errors (Linux/macOS)** | Run with `sudo` if needed for raw socket access. |
 
 ---

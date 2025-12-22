@@ -10,6 +10,7 @@ import logging
 import platform
 import requests
 import json
+import ifaddr
 from typing import Optional, Any
 
 def _run(cmd: list[str]) -> str:
@@ -96,14 +97,48 @@ def parse_windows_netsh_networks(text: str) -> list[dict[str, Any]]:
         networks.append(current)
     return networks
 
+def _active_wired_hint() -> Optional[str]:
+    try:
+        for ad in ifaddr.get_adapters():
+            name = (ad.nice_name or ad.name or "").lower()
+            is_wifi = any(k in name for k in ["wi-fi", "wifi", "wlan", "wireless", "air"])
+            for ip in ad.ips:
+                addr = str(ip.ip)
+                if ":" in addr:
+                    continue
+                if addr.startswith("169.254.") or addr.startswith("127."):
+                    continue
+                if not is_wifi:
+                    return f"Wired connection active ({ad.nice_name or ad.name}: {addr})"
+    except Exception:
+        pass
+    return None
+
+def _adapter_lines() -> list[str]:
+    lines = []
+    try:
+        for ad in ifaddr.get_adapters():
+            name = ad.nice_name or ad.name or "Unknown"
+            addrs = []
+            for ip in ad.ips:
+                addr = str(ip.ip)
+                if ":" in addr:
+                    continue
+                addrs.append(addr)
+            if addrs:
+                lines.append(f"Adapter: {name} | IPv4: {', '.join(addrs)}")
+    except Exception:
+        pass
+    return lines
+
 def parse_nmcli(text: str) -> list[dict[str, Any]]:
     nets = []
     for line in text.splitlines():
         # nmcli -t is colon separated but can escape colons. Simple split for now.
-        parts = line.split(":")
+        parts = re.split(r"(?<!\\):", line)
         if len(parts) < 5: continue
         ssid, bssid, chan, sig, sec = parts[:5]
-        
+
         # Clean up escaped chars if necessary
         ssid = ssid.replace("\\:", ":")
         
@@ -165,8 +200,9 @@ def _post_json(url, payload, timeout=5):
         logging.debug(f"HTTP POST {url} failed: {e}")
         return None
 
-def geolocate_bssids(bssids: list[str]) -> Optional[dict]:
+def geolocate_bssids(bssids: list[str], allow_external: bool) -> Optional[dict]:
     if not bssids: return None
+    if not allow_external: return None
     mls = os.getenv("MLS_API_KEY")
     gkey = os.getenv("GOOGLE_GEO_API_KEY")
     
@@ -183,15 +219,9 @@ def geolocate_bssids(bssids: list[str]) -> Optional[dict]:
         if r and r.ok: return r.json()
     return None
 
-def geolocate_ip_fallback() -> Optional[dict]:
-    try:
-        r = requests.get("http://ip-api.com/json/", timeout=4)
-        if r.ok:
-            j = r.json()
-            if j.get("lat") and j.get("lon"):
-                return {"location": {"lat": j["lat"], "lng": j["lon"]}, "accuracy": None}
-    except Exception:
-        pass
+def geolocate_ip_fallback(allow_external: bool) -> Optional[dict]:
+    if not allow_external:
+        return None
     try:
         r = requests.get("https://ipapi.co/json/", timeout=4)
         if r.ok:
@@ -208,6 +238,7 @@ def scan_wifi(wifi_interface: Optional[str] = None,
               output_queue=None,
               stop_flag=None,
               do_geolocation: bool = False,
+              allow_external: bool = True,
               diag: bool = False,
               **_ignore) -> dict[str, Any]:
     """
@@ -234,12 +265,25 @@ def scan_wifi(wifi_interface: Optional[str] = None,
             names = parse_windows_interfaces(int_text)
             if wifi_interface:
                 names = [wifi_interface]
-
-            if diag and output_queue:
-                output_queue.put("--- Wi-Fi diag (Windows) ---")
-                for line in int_text.splitlines():
-                    output_queue.put("  " + line)
-
+            if diag:
+                if output_queue:
+                    output_queue.put("--- Wi-Fi diag (Windows) ---")
+                    for line in int_text.splitlines():
+                        output_queue.put("  " + line)
+                    for line in _adapter_lines():
+                        output_queue.put("  " + line)
+                    wired_hint = _active_wired_hint()
+                    if wired_hint:
+                        output_queue.put("  " + wired_hint)
+                else:
+                    print("--- Wi-Fi diag (Windows) ---")
+                    for line in int_text.splitlines():
+                        print("  " + line)
+                    for line in _adapter_lines():
+                        print("  " + line)
+                    wired_hint = _active_wired_hint()
+                    if wired_hint:
+                        print("  " + wired_hint)
             if not names:
                 msg = "No wireless interfaces detected."
                 result.update({"status": "no_adapter", "note": msg, "reason": "no_interface"})
@@ -248,15 +292,20 @@ def scan_wifi(wifi_interface: Optional[str] = None,
 
             # Attempt a scan per interface
             all_errors = []
+            saw_admin_error = False
+            saw_location_error = False
             for name in names:
                 out = _run(["netsh", "wlan", "show", "networks", f"interface={name}", "mode=Bssid"])
                 lower = (out or "").lower()
-
-                if diag and output_queue:
-                    output_queue.put(f"--- netsh show networks for '{name}' ---")
-                    for line in (out or "").splitlines():
-                        output_queue.put("  " + line)
-
+                if diag:
+                    if output_queue:
+                        output_queue.put(f"--- netsh show networks for '{name}' ---")
+                        for line in (out or "").splitlines():
+                            output_queue.put("  " + line)
+                    else:
+                        print(f"--- netsh show networks for '{name}' ---")
+                        for line in (out or "").splitlines():
+                            print("  " + line)
                 # Detect common permission cases
                 needs_location = ("location permission" in lower) or ("ms-settings:privacy-location" in lower)
                 needs_admin    = ("requires elevation" in lower) or ("access is denied" in lower)
@@ -265,10 +314,11 @@ def scan_wifi(wifi_interface: Optional[str] = None,
                     reason = []
                     if needs_location:
                         reason.append("Location services disabled")
+                        saw_location_error = True
                     if needs_admin or admin is False:
                         reason.append("Not elevated (Run as Administrator)")
+                        saw_admin_error = True
                     all_errors.append(", ".join(reason))
-                    continue
 
                 nets = parse_windows_netsh_networks(out)
                 networks.extend(nets)
@@ -280,12 +330,17 @@ def scan_wifi(wifi_interface: Optional[str] = None,
                     note_bits.append("WLAN AutoConfig service is STOPPED")
                 if lfsvc is False:
                     note_bits.append("Geolocation service (lfsvc) is STOPPED")
-                if admin is False:
+                if saw_admin_error:
                     note_bits.append("Not running elevated (Administrator)")
+                if saw_location_error:
+                    note_bits.append("Location services disabled")
                 if not note_bits and all_errors:
                     note_bits.append("; ".join(all_errors))
                 if not note_bits and "State                  : disconnected" in int_text:
                     note_bits.append("Wi-Fi adapter is disconnected")
+                wired_hint = _active_wired_hint()
+                if wired_hint:
+                    note_bits.append(wired_hint)
 
                 reason = "; ".join(note_bits) if note_bits else "No scanable networks returned by netsh"
                 msg = f"Wi-Fi scan returned no data — {reason}."
@@ -322,11 +377,15 @@ def scan_wifi(wifi_interface: Optional[str] = None,
 
         # Optional geolocation
         if networks:
-            if do_geolocation:
+            if do_geolocation and not allow_external:
+                msg = "Geolocation requested but external lookups are disabled."
+                logging.info(msg)
+                if output_queue: output_queue.put(msg)
+            elif do_geolocation:
                 if output_queue: output_queue.put("Performing geolocation lookup...")
                 all_bssids = sorted({b for n in networks for b in (n.get("bssids") or [])})
                 # Prefer BSSID lookup, fallback to IP
-                geo = geolocate_bssids(all_bssids) or geolocate_ip_fallback()
+                geo = geolocate_bssids(all_bssids, allow_external=allow_external) or geolocate_ip_fallback(allow_external=allow_external)
                 
                 if geo and "location" in geo:
                     for n in networks:

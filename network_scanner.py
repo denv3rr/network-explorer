@@ -83,26 +83,38 @@ def _default_gateway() -> Optional[str]:
 
 # --- LAN DISCOVERY & VENDOR LOOKUP ---
 
-def _lookup_mac_vendor(mac_address: str) -> str:
+_OUI_CACHE: Dict[str, str] = {}
+
+def _lookup_mac_vendor(mac_address: str, allow_external: bool, session: Optional[requests.Session] = None) -> str:
     """
     Queries macvendors.co API.
     """
     if not mac_address or len(mac_address) < 8:
         return "Unknown"
-    
+
+    if not allow_external:
+        return "Skipped (external lookups disabled)"
+
+    oui = mac_address.replace("-", ":").lower()[:8]
+    if oui in _OUI_CACHE:
+        return _OUI_CACHE[oui]
+
     try:
         # Simple API call
         url = f"https://macvendors.co/api/{mac_address}"
-        r = requests.get(url, timeout=1.5) # Fast timeout
+        sess = session or requests.Session()
+        r = sess.get(url, timeout=1.5) # Fast timeout
         if r.ok:
             data = r.json()
             if "result" in data and "company" in data["result"]:
-                return data["result"]["company"]
+                vendor = data["result"]["company"]
+                _OUI_CACHE[oui] = vendor
+                return vendor
     except:
         pass
     return "Unknown"
 
-def get_network_devices() -> Dict[str, List[Dict[str, str]]]:
+def get_network_devices(allow_external: bool = True, session: Optional[requests.Session] = None) -> Dict[str, List[Dict[str, str]]]:
     """
     Reads ARP table and resolves OUI vendors.
     """
@@ -149,7 +161,7 @@ def get_network_devices() -> Dict[str, List[Dict[str, str]]]:
             if ip.startswith("127.") or "224." in ip or "239." in ip or ip == "0.0.0.0": continue
             
             # Lookup Vendor
-            vendor = _lookup_mac_vendor(mac)
+            vendor = _lookup_mac_vendor(mac, allow_external=allow_external, session=session)
             devices["IPv4"].append({"ip": ip, "mac": mac, "vendor": vendor})
 
     # Sort by IP
@@ -158,29 +170,33 @@ def get_network_devices() -> Dict[str, List[Dict[str, str]]]:
 
 # --- GEO LOOKUP ---
 
-def lookup_target_ip(target: str) -> Dict[str, Any]:
+def lookup_target_ip(target: str, allow_external: bool = True, session: Optional[requests.Session] = None) -> Dict[str, Any]:
     try:
+        if not allow_external:
+            return {"error": "External lookups disabled. Use --external to enable."}
+
         try:
             target_ip = socket.gethostbyname(target)
         except:
             return {"error": f"Could not resolve domain: {target}"}
 
-        r = requests.get(f"http://ip-api.com/json/{target_ip}", timeout=5)
+        sess = session or requests.Session()
+        r = sess.get(f"https://ipapi.co/{target_ip}/json/", timeout=5)
         if r.ok:
             j = r.json()
-            if j.get("status") == "fail":
-                return {"error": j.get("message", "Lookup failed")}
-            
+            if j.get("error"):
+                return {"error": j.get("reason", "Lookup failed")}
+
             return {
                 "target": target,
                 "resolved_ip": target_ip,
-                "isp": j.get("isp"),
+                "isp": j.get("org"),
                 "org": j.get("org"),
-                "as": j.get("as"),
+                "as": j.get("asn"),
                 "city": j.get("city"),
-                "country": j.get("country"),
-                "lat": j.get("lat"),
-                "lon": j.get("lon"),
+                "country": j.get("country_name"),
+                "lat": j.get("latitude"),
+                "lon": j.get("longitude"),
                 "timezone": j.get("timezone")
             }
         else:
@@ -188,28 +204,32 @@ def lookup_target_ip(target: str) -> Dict[str, Any]:
     except Exception as e:
         return {"error": str(e)}
 
-def _public_ip_geo() -> Optional[Dict[str, Any]]:
+def _public_ip_geo(allow_external: bool = True, session: Optional[requests.Session] = None) -> Optional[Dict[str, Any]]:
+    if not allow_external:
+        return None
+
     try:
-        r = requests.get("http://ip-api.com/json/", timeout=3)
+        sess = session or requests.Session()
+        r = sess.get("https://ipapi.co/json/", timeout=3)
         if r.ok:
             j = r.json()
             return {
-                "ip": j.get("query"),
-                "isp": j.get("isp"),
-                "asn": j.get("as"),
+                "ip": j.get("ip"),
+                "isp": j.get("org"),
+                "asn": j.get("asn"),
                 "city": j.get("city"),
-                "region": j.get("regionName"),
-                "country": j.get("country"),
-                "lat": j.get("lat"),
-                "lon": j.get("lon"),
+                "region": j.get("region"),
+                "country": j.get("country_name"),
+                "lat": j.get("latitude"),
+                "lon": j.get("longitude"),
             }
     except Exception:
         pass
     return None
 
-def get_quick_identity() -> Dict[str, Any]:
+def get_quick_identity(allow_external: bool = True) -> Dict[str, Any]:
     local_ip = _best_local_ipv4()
-    public = _public_ip_geo()
+    public = _public_ip_geo(allow_external=allow_external)
     
     conn_type = "Unknown"
     if local_ip:
@@ -229,7 +249,7 @@ def get_quick_identity() -> Dict[str, Any]:
         "hostname": socket.gethostname()
     }
 
-def run_network_metadata_scan(output_queue=None, stop_flag=None, **kwargs):
+def run_network_metadata_scan(output_queue=None, stop_flag=None, allow_external: bool = True, **kwargs):
     try:
         if stop_flag and getattr(stop_flag, "is_set", lambda: False)():
             return {"status": "stopped"}
@@ -239,7 +259,7 @@ def run_network_metadata_scan(output_queue=None, stop_flag=None, **kwargs):
         local_ip = _best_local_ipv4()
         interfaces = _list_interfaces()
         gateway = _default_gateway()
-        public = _public_ip_geo()
+        public = _public_ip_geo(allow_external=allow_external)
 
         msg = f"Host: {hostname} | Local: {local_ip} | OS: {os_name}"
         logging.info(msg)

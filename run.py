@@ -17,6 +17,11 @@ def check_and_install_requirements():
     missing = [p for p in REQUIRED_PACKAGES if not is_installed(p)]
     if missing:
         print(f"[🔧] Installing missing packages: {', '.join(missing)}")
+        if os.getenv("NEX_AUTO_INSTALL") != "1" and sys.stdin.isatty():
+            resp = input("Install missing packages now? (y/N): ").strip().lower()
+            if resp not in ("y", "yes"):
+                print("Aborting. Set NEX_AUTO_INSTALL=1 to auto-install.")
+                sys.exit(1)
 
         subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
 
